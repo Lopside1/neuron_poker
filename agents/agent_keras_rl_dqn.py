@@ -1,223 +1,179 @@
-"""Player based on a trained neural network"""
-# pylint: disable=wrong-import-order,invalid-name,import-error,missing-function-docstring
-import logging
-import time
+"""
+Player based on a trained neural network using Ray RLlib’s new API stack 
+with RLModule (PyTorch). This code defines a custom DQN RLModule with three 
+dense layers and dropout, sets up an RLlib DQN agent using the new API stack, 
+and provides training and evaluation (play) methods.
+"""
 
+import time
+import json
+import logging
+import gym
 import numpy as np
 
-from gym_env.enums import Action
+import tune
 
-import tensorflow as tf
-import json
+import ray
+from ray import tune
+from ray import air
+from ray.rllib.algorithms.dqn import DQN, DQNConfig  # New API: use ray.rllib.algorithms
 
-from tensorflow.keras.models import Sequential, model_from_json
-from tensorflow.keras.callbacks import TensorBoard
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from rl.policy import BoltzmannQPolicy
-from rl.memory import SequentialMemory
-from rl.agents import DQNAgent
-from rl.core import Processor
+# Import the TorchRLModule base class from the new RLModule API.
+from ray.rllib.core.rl_module.torch.torch_rl_module import TorchRLModule
 
-autoplay = True  # play automatically if played against keras-rl
-
-window_length = 1
-nb_max_start_steps = 1  # random action
-train_interval = 100  # train every 100 steps
-nb_steps_warmup = 50  # before training starts, should be higher than start steps
-nb_steps = 100000
-memory_limit = int(nb_steps / 2)
-batch_size = 500  # items sampled from memory to train
-enable_double_dqn = False
-
+# Set up logging
 log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
+# -----------------------------------------------------------------------------
+# Define a custom RLModule for DQN.
+#
+# We subclass TorchRLModule and implement the three required methods:
+#   - forward_train: for computing Q-values during training (with dropout active)
+#   - forward_inference: for evaluation (without dropout)
+#   - forward_exploration: for action selection during exploration (can use dropout noise)
+#
+# The network architecture is similar to your original model.
+# -----------------------------------------------------------------------------
+class CustomDQNModule(TorchRLModule):
+    def __init__(self, observation_space, action_space, num_outputs, model_config, name, **kwargs):
+        # Call parent constructors.
+        TorchRLModule.__init__(self, observation_space, action_space, num_outputs, model_config, name)
+        
+        # Determine input size from the observation space.
+        input_size = int(np.product(observation_space.shape))
+        
+        # Build a network with three Dense layers (512 units each) with dropout.
+        self.fc1 = nn.Linear(input_size, 512)
+        self.dropout1 = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(512, 512)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc3 = nn.Linear(512, 512)
+        self.dropout3 = nn.Dropout(0.2)
+        self.fc_out = nn.Linear(512, num_outputs)
+    
+    def forward_train(self, input_dict, **kwargs):
+        # input_dict is expected to contain the observation under key "obs"
+        x = input_dict["obs"]
+        if len(x.shape) > 2:
+            x = torch.flatten(x, start_dim=1)
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)  # dropout active during training
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        x = F.relu(self.fc3(x))
+        x = self.dropout3(x)
+        q = self.fc_out(x)
+        return {"q_values": q}
+
+    def forward_inference(self, input_dict, **kwargs):
+        # In inference mode, disable dropout.
+        self.eval()  # switch to evaluation mode
+        with torch.no_grad():
+            x = input_dict["obs"]
+            if len(x.shape) > 2:
+                x = torch.flatten(x, start_dim=1)
+            x = F.relu(self.fc1(x))
+            # Note: dropout layers are effectively bypassed in eval mode.
+            x = F.relu(self.fc2(x))
+            x = F.relu(self.fc3(x))
+            q = self.fc_out(x)
+        self.train()  # switch back to train mode for future calls
+        return {"q_values": q}
+
+    def forward_exploration(self, input_dict, **kwargs):
+        # For exploration, we can simply use the training forward pass.
+        # (If you wish to incorporate noise differently during exploration,
+        #  adjust this method accordingly.)
+        return self.forward_train(input_dict, **kwargs)
+
+
+# -----------------------------------------------------------------------------
+# Define the Player class using RLlib’s new DQN API with RLModule (PyTorch).
+#
+# Notice: instead of using ModelCatalog and the "custom_model" key, we now use
+# the new .rl_module() builder on the config to set our custom RLModule.
+# -----------------------------------------------------------------------------
 class Player:
-    """Mandatory class with the player methods"""
-
-    def __init__(self, name='DQN', load_model=None, env=None):
-        """Initiaization of an agent"""
-        self.equity_alive = 0
-        self.actions = []
-        self.last_action_in_stage = ''
-        self.temp_stack = []
-        self.name = name
-        self.autoplay = True
-
-        self.dqn = None
-        self.model = None
-        self.env = env
-
-        if load_model:
-            self.load(load_model)
-
-    def initiate_agent(self, env):
-        """initiate a deep Q agent"""
-        tf.compat.v1.disable_eager_execution()
-
-        self.env = env
-
-        nb_actions = self.env.action_space.n
-
-        self.model = Sequential()
-        self.model.add(Dense(512, activation='relu', input_shape=env.observation_space))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(512, activation='relu'))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(512, activation='relu'))
-        self.model.add(Dropout(0.2))
-        self.model.add(Dense(nb_actions, activation='linear'))
-
-        # Finally, we configure and compile our agent. You can use every built-in Keras optimizer and
-        # even the metrics!
-        memory = SequentialMemory(limit=memory_limit, window_length=window_length)
-        policy = TrumpPolicy()
-
-        nb_actions = env.action_space.n
-
-        self.dqn = DQNAgent(model=self.model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=nb_steps_warmup,
-                            target_model_update=1e-2, policy=policy,
-                            processor=CustomProcessor(),
-                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn)
-        self.dqn.compile(Adam(lr=1e-3), metrics=['mae'])
-
-    def start_step_policy(self, observation):
-        """Custom policy for random decisions for warm up."""
-        log.info("Random action")
-        _ = observation
-        action = self.env.action_space.sample()
-        return action
-
-    def train(self, env_name):
-        """Train a model"""
-        # initiate training loop
-        timestr = time.strftime("%Y%m%d-%H%M%S") + "_" + str(env_name)
-        tensorboard = TensorBoard(log_dir='./Graph/{}'.format(timestr), histogram_freq=0, write_graph=True,
-                                  write_images=False)
-
-        self.dqn.fit(self.env, nb_max_start_steps=nb_max_start_steps, nb_steps=nb_steps, visualize=False, verbose=2,
-                     start_step_policy=self.start_step_policy, callbacks=[tensorboard])
-
-        # Save the architecture
-        dqn_json = self.model.to_json()
-        with open("dqn_{}_json.json".format(env_name), "w") as json_file:
-            json.dump(dqn_json, json_file)
-
-        # After training is done, we save the final weights.
-        self.dqn.save_weights('dqn_{}_weights.h5'.format(env_name), overwrite=True)
-
-        # Finally, evaluate our algorithm for 5 episodes.
-        self.dqn.test(self.env, nb_episodes=5, visualize=False)
-
-    def load(self, env_name):
-        """Load a model"""
-
-        # Load the architecture
-        with open('dqn_{}_json.json'.format(env_name), 'r') as architecture_json:
-            dqn_json = json.load(architecture_json)
-
-        self.model = model_from_json(dqn_json)
-        self.model.load_weights('dqn_{}_weights.h5'.format(env_name))
-
-    def play(self, nb_episodes=5, render=False):
-        """Let the agent play"""
-        memory = SequentialMemory(limit=memory_limit, window_length=window_length)
-        policy = TrumpPolicy()
-
-        class CustomProcessor(Processor):  # pylint: disable=redefined-outer-name
-            """The agent and the environment"""
-
-            def process_state_batch(self, batch):
-                """
-                Given a state batch, I want to remove the second dimension, because it's
-                useless and prevents me from feeding the tensor into my CNN
-                """
-                return np.squeeze(batch, axis=1)
-
-            def process_info(self, info):
-                processed_info = info['player_data']
-                if 'stack' in processed_info:
-                    processed_info = {'x': 1}
-                return processed_info
-
-        nb_actions = self.env.action_space.n
-
-        self.dqn = DQNAgent(model=self.model, nb_actions=nb_actions, memory=memory, nb_steps_warmup=nb_steps_warmup,
-                            target_model_update=1e-2, policy=policy,
-                            processor=CustomProcessor(),
-                            batch_size=batch_size, train_interval=train_interval, enable_double_dqn=enable_double_dqn)
-        self.dqn.compile(Adam(lr=1e-3), metrics=['mae'])  # pylint: disable=no-member
-
-        self.dqn.test(self.env, nb_episodes=nb_episodes, visualize=render)
-
-    def action(self, action_space, observation, info):  # pylint: disable=no-self-use
-        """Mandatory method that calculates the move based on the observation array and the action space."""
-        _ = observation  # not using the observation for random decision
-        _ = info
-
-        this_player_action_space = {Action.FOLD, Action.CHECK, Action.CALL, Action.RAISE_POT, Action.RAISE_HALF_POT,
-                                    Action.RAISE_2POT}
-        _ = this_player_action_space.intersection(set(action_space))
-
-        action = None
-        return action
-
-
-class TrumpPolicy(BoltzmannQPolicy):
-    """Custom policy when making decision based on neural network."""
-
-    def select_action(self, q_values):
-        """Return the selected action
-
-        # Arguments
-            q_values (np.ndarray): List of the estimations of Q for each action
-
-        # Returns
-            Selection action
+    def __init__(self, name="DQN", env_name=None, config_overrides=None, checkpoint_path=None):
         """
-        assert q_values.ndim == 1
-        q_values = q_values.astype('float64')
-        nb_actions = q_values.shape[0]
+        :param name: Name for the agent.
+        :param env_name: Gym environment id (e.g., "CartPole-v1" or your custom env).
+        :param config_overrides: (Optional) dict to override default RLlib DQN config.
+        :param checkpoint_path: (Optional) path to a checkpoint to restore from.
+        """
+        self.name = name
+        self.env_name = env_name
+        self.checkpoint_path = checkpoint_path
 
-        exp_values = np.exp(np.clip(q_values / self.tau, self.clip[0], self.clip[1]))
-        probs = exp_values / np.sum(exp_values)
-        action = np.random.choice(range(nb_actions), p=probs)
-        log.info(f"Chosen action by keras-rl {action} - probabilities: {probs}")
-        return action
+        self.config = (
+            #TODO For a complete rainbow setup, make the following changes to the default DQN config: "n_step": [between 1 and 10], "noisy": True, "num_atoms": [more than 1], "v_min": -10.0, "v_max": 10.0 (set v_min and v_max according to your expected range of returns).
+            DQNConfig()
+            .environment(env=env_name)
+            .training(
+                num_atoms=tune.grid_search([1,])
+            )
+        )
+
+        # Restore from checkpoint if provided.
+        if checkpoint_path:
+            raise NotImplementedError("Restoring from checkpoint is not implemented yet. Code needs to be updated.")
+            self.agent.restore(checkpoint_path)
+            log.info(f"Restored agent from checkpoint: {checkpoint_path}")
+
+    def train(self, num_iterations=100):
+        self.tuner = tune.Tuner(
+            "DQN",
+            run_config=air.RunConfig(
+                stop={"training_iteration": num_iterations}
+                ),
+            param_space=self.config
+        )
+        self.tuner.fit()
+
+    def play(self, num_episodes=5, render=False):
+        """Run the trained agent in the environment for a number of episodes."""
+        env = gym.make(self.env_name)
+        for episode in range(num_episodes):
+            obs = env.reset()
+            done = False
+            total_reward = 0
+            while not done:
+                if render:
+                    env.render()
+                # Use the compute_single_action method.
+                action = self.agent.compute_single_action(obs)
+                obs, reward, done, info = env.step(action)
+                total_reward += reward
+            log.info(f"Episode {episode}: total reward = {total_reward}")
+        env.close()
+
+    def get_action(self, obs):
+        """Return the action for a given observation."""
+        return self.agent.compute_single_action(obs)
 
 
-class CustomProcessor(Processor):
-    """The agent and the environment"""
+# -----------------------------------------------------------------------------
+# Example usage: training and evaluation.
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Initialize Ray.
+    ray.init(ignore_reinit_error=True)
 
-    def __init__(self):
-        """initizlie properties"""
-        self.legal_moves_limit = None
+    # Use a Gym environment (replace with your custom env if needed).
+    env_name = "CartPole-v1"
+    player = Player(name="DQN", env_name=env_name)
 
-    def process_state_batch(self, batch):
-        """Remove second dimension to make it possible to pass it into cnn"""
-        return np.squeeze(batch, axis=1)
+    # Train the agent for 100 iterations (adjust as needed).
+    player.train(num_iterations=100)
 
-    def process_info(self, info):
-        if 'legal_moves' in info.keys():
-            self.legal_moves_limit = info['legal_moves']
-        else:
-            self.legal_moves_limit = None
-        return {'x': 1}  # on arrays allowed it seems
+    # Evaluate the trained agent for 5 episodes (set render=True to visualize).
+    player.play(num_episodes=5, render=False)
 
-    def process_action(self, action):
-        """Find nearest legal action"""
-        if 'legal_moves_limit' in self.__dict__ and self.legal_moves_limit is not None:
-            self.legal_moves_limit = [move.value for move in self.legal_moves_limit]
-            if action not in self.legal_moves_limit:
-                for i in range(5):
-                    action += i
-                    if action in self.legal_moves_limit:
-                        break
-                    action -= i * 2
-                    if action in self.legal_moves_limit:
-                        break
-                    action += i
-
-        return action
+    # Shutdown Ray when finished.
+    ray.shutdown()

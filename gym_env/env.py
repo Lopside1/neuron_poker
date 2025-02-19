@@ -20,7 +20,6 @@ log = logging.getLogger(__name__)
 winner_in_episodes = []
 MONTEACRLO_RUNS = 1000  # relevant for equity calculation if switched on
 
-
 class CommunityData:
     """Data available to everybody"""
 

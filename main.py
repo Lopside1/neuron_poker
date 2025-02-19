@@ -45,7 +45,7 @@ def command_line_parser():
     else:
         print("Using default log file")
         logfile = 'default'
-    model_name = args['--name'] if args['--name'] else 'dqn1'
+    model_name = args['--name'] if args['--name'] else 'CartPole-v1'
     screenloglevel = logging.INFO if not args['--screenloglevel'] else \
         getattr(logging, args['--screenloglevel'].upper())
     _ = get_config()
@@ -199,9 +199,9 @@ class SelfPlay:
 
         env.reset()
 
-        dqn = DQNPlayer()
-        dqn.initiate_agent(env)
-        dqn.train(env_name=model_name)
+        dqn = DQNPlayer(env_name=model_name)
+        # dqn.initiate_agent(env)
+        dqn.train()
 
     def dqn_play_keras_rl(self, model_name):
         """Create 6 players, one of them a trained DQN"""
